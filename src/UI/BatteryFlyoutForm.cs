@@ -396,10 +396,14 @@ namespace MaicongTray
                 BitmapData data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
                 try
                 {
+                    int expectedBytes = w * 4 * h;
                     int byteCount = Math.Abs(data.Stride) * h;
-                    byte[] raw = new byte[byteCount];
-                    Marshal.Copy(data.Scan0, raw, 0, byteCount);
-                    Marshal.Copy(raw, 0, bits, byteCount);
+                    if (byteCount == expectedBytes)
+                    {
+                        byte[] raw = new byte[byteCount];
+                        Marshal.Copy(data.Scan0, raw, 0, byteCount);
+                        Marshal.Copy(raw, 0, bits, byteCount);
+                    }
                 }
                 finally
                 {
@@ -1178,7 +1182,7 @@ namespace MaicongTray
             using (var vb = new SolidBrush(pal.TextMuted))
             {
                 g.DrawString("偏好设置", hFont, tb, 52f, 20f);
-                string ver = "v2.1.0";
+                string ver = "v2.1.1";
                 SizeF vsz = g.MeasureString(ver, verFont);
                 g.DrawString(ver, verFont, vb, BaseW - 16f - vsz.Width, 23f);
             }

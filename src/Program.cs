@@ -14,8 +14,8 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("MaicongTray")]
 [assembly: AssemblyDescription("迈从鼠标电量托盘")]
 [assembly: AssemblyProduct("MaicongTray")]
-[assembly: AssemblyVersion("2.1.0.0")]
-[assembly: AssemblyFileVersion("2.1.0.0")]
+[assembly: AssemblyVersion("2.1.1.0")]
+[assembly: AssemblyFileVersion("2.1.1.0")]
 
 namespace MaicongTray
 {
@@ -99,7 +99,12 @@ namespace MaicongTray
                 return RunDpiProbe();
             }
 
-            Console.WriteLine("迈从 A7 V2 Ultra 电量检测 v2.1.0 (协议: 经典 0x11/0x06 + V2 0x4D 备用)");
+            if (cmd == "--stress")
+            {
+                return RunGcStressTest();
+            }
+
+            Console.WriteLine("迈从 A7 V2 Ultra 电量检测 v2.1.1 (协议: 经典 0x11/0x06 + V2 0x4D 备用)");
             Console.WriteLine(new string('-', 64));
             var log = new List<string>();
             BatteryResult r = BatteryReader.Read(log);
@@ -273,6 +278,34 @@ namespace MaicongTray
                 b4.Save(Path.Combine(outDir, "flyout_sleep.png"), ImageFormat.Png);
         }
 
+        private static int RunGcStressTest()
+        {
+            Console.WriteLine("Running DeviceWatcher + aggressive GC compaction stress test (4s)...");
+            var w = new DeviceWatcher();
+            int updates = 0;
+            w.Updated += delegate(BatteryResult r)
+            {
+                Interlocked.Increment(ref updates);
+                Console.WriteLine("  Update #" + updates + ": " + r.DisplayText() + " FW=" + r.Firmware);
+            };
+            w.Start();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var junk = new List<byte[]>();
+            while (sw.ElapsedMilliseconds < 4000)
+            {
+                for (int i = 0; i < 64; i++) junk.Add(new byte[4096]);
+                if (junk.Count > 256) junk.Clear();
+                GC.Collect(2, GCCollectionMode.Forced, true);
+                GC.WaitForPendingFinalizers();
+                Thread.Sleep(150);
+            }
+            foreach (string line in w.GetLog()) Console.WriteLine("  [log] " + line);
+            w.Stop();
+            Thread.Sleep(350);
+            Console.WriteLine("Stress test PASSED cleanly! Updates=" + updates + " Snapshot=" + w.Snapshot().DisplayText());
+            return 0;
+        }
+
         private static int RunDpiProbe()
         {
             foreach (var d in NativeHid.Enumerate())
@@ -284,50 +317,58 @@ namespace MaicongTray
                 var h = NativeHid.Open(d.Path);
                 if (h.IsInvalid) { Console.WriteLine("打开失败"); continue; }
                 int len = d.FeatureLen;
-                IntPtr ev = NativeHid.CreateEvent(IntPtr.Zero, true, false, null);
-                var ov = new NativeHid.OVERLAPPED();
-                ov.EventHandle = ev;
-                byte[] inBuf = new byte[d.InputLen];
-                uint tmp;
-                bool pending = NativeHid.ReadFile(h, inBuf, (uint)inBuf.Length, out tmp, ref ov)
-                    || NativeHid.LastError() == NativeHid.ERROR_IO_PENDING;
-                Console.WriteLine("挂起读取: " + pending);
-
-                byte[] q11 = new byte[len];
-                q11[0] = 0x11; q11[1] = 0x06 ^ 0xFF;
-                for (int i = 2; i < len; i++) q11[i] = 0xFF;
-                Console.WriteLine("0x11/0x06 SetFeature: " + NativeHid.HidD_SetFeature(h, q11, len));
-                Thread.Sleep(500);
-
-                byte[] req = new byte[len];
-                req[0] = 0x12; req[1] = 0x67 ^ 0xFF;
-                for (int i = 2; i < len; i++) req[i] = 0xFF;
-                Console.WriteLine("0x12/0x67 SetFeature: " + NativeHid.HidD_SetFeature(h, req, len));
-
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                while (sw.ElapsedMilliseconds < 4000)
+                using (var uo = new NativeHid.UnmanagedOverlapped(d.InputLen))
                 {
-                    if (pending && NativeHid.WaitForSingleObject(ev, 0) == 0 && NativeHid.GetOverlappedResult(h, ref ov, out tmp, false) && tmp > 0)
+                    uo.ResetForIo();
+                    uint tmp;
+                    bool okR = NativeHid.ReadFile(h, uo.Buffer, (uint)d.InputLen, out tmp, uo.OvPtr);
+                    bool pending = okR || NativeHid.LastError() == NativeHid.ERROR_IO_PENDING;
+                    Console.WriteLine("挂起读取: " + pending);
+
+                    byte[] q11 = new byte[len];
+                    q11[0] = 0x11; q11[1] = 0x06 ^ 0xFF;
+                    for (int i = 2; i < len; i++) q11[i] = 0xFF;
+                    Console.WriteLine("0x11/0x06 SetFeature: " + NativeHid.HidD_SetFeature(h, q11, len));
+                    Thread.Sleep(500);
+
+                    byte[] req = new byte[len];
+                    req[0] = 0x12; req[1] = 0x67 ^ 0xFF;
+                    for (int i = 2; i < len; i++) req[i] = 0xFF;
+                    Console.WriteLine("0x12/0x67 SetFeature: " + NativeHid.HidD_SetFeature(h, req, len));
+
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    try
                     {
-                        int n = (int)Math.Min(tmp, (uint)inBuf.Length);
-                        Console.WriteLine("IN  (" + n + "): " + NativeHid.Hex(inBuf.Take(n).ToArray()));
-                        if (NativeHid.ResetEvent(ev))
+                        while (sw.ElapsedMilliseconds < 4000)
                         {
-                            uint t2;
-                            pending = NativeHid.ReadFile(h, inBuf, (uint)inBuf.Length, out t2, ref ov)
-                                || NativeHid.LastError() == NativeHid.ERROR_IO_PENDING;
+                            if (pending && NativeHid.WaitForSingleObject(uo.EventHandle, 0) == 0 && NativeHid.GetOverlappedResult(h, uo.OvPtr, out tmp, false))
+                            {
+                                pending = false;
+                                if (tmp > 0)
+                                {
+                                    byte[] inBuf = uo.ReadManaged((int)tmp);
+                                    Console.WriteLine("IN  (" + inBuf.Length + "): " + NativeHid.Hex(inBuf));
+                                }
+                                uo.ResetForIo();
+                                uint t2;
+                                pending = NativeHid.ReadFile(h, uo.Buffer, (uint)d.InputLen, out t2, uo.OvPtr)
+                                    || NativeHid.LastError() == NativeHid.ERROR_IO_PENDING;
+                            }
+                            byte[] raw = new byte[len];
+                            raw[0] = 0x12;
+                            if (NativeHid.HidD_GetFeature(h, raw, len))
+                            {
+                                if (raw[1] != 0xFF) Console.WriteLine("FEAT: " + NativeHid.Hex(raw.Take(Math.Min(len, 20)).ToArray()));
+                            }
+                            else Console.WriteLine("FEAT err " + NativeHid.LastError());
+                            Thread.Sleep(200);
                         }
                     }
-                    byte[] raw = new byte[len];
-                    raw[0] = 0x12;
-                    if (NativeHid.HidD_GetFeature(h, raw, len))
+                    finally
                     {
-                        if (raw[1] != 0xFF) Console.WriteLine("FEAT: " + NativeHid.Hex(raw.Take(Math.Min(len, 20)).ToArray()));
+                        if (pending) uo.CancelAndDrain(h);
                     }
-                    else Console.WriteLine("FEAT err " + NativeHid.LastError());
-                    Thread.Sleep(200);
                 }
-                NativeHid.CloseHandle(ev);
                 h.Close();
                 break;
             }

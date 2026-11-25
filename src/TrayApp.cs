@@ -683,33 +683,41 @@ namespace MaicongTray
 
             protected override void WndProc(ref Message m)
             {
-                if (m.Msg == WM_DEVICECHANGE && m.WParam.ToInt64() == DBT_DEVICEARRIVAL
-                    && DeviceArrival != null && m.LParam != IntPtr.Zero)
+                try
                 {
-                    var hdr = (DEV_BROADCAST_DEVICEINTERFACE)Marshal.PtrToStructure(m.LParam, typeof(DEV_BROADCAST_DEVICEINTERFACE));
-                    if (hdr.dbcc_devicetype == DBT_DEVTYP_DEVICEINTERFACE) DeviceArrival();
-                }
-                else if (m.Msg == TaskbarCreatedMessage && TaskbarCreated != null)
-                {
-                    TaskbarCreated();
-                }
-                else if (m.Msg == WM_POWERBROADCAST && PowerResumed != null)
-                {
-                    int ev = (int)(m.WParam.ToInt64() & 0xFFFF);
-                    if (ev == PBT_APMRESUMEAUTOMATIC || ev == PBT_APMRESUMESUSPEND) PowerResumed();
-                }
-                else if ((m.Msg == WM_SETTINGCHANGE || m.Msg == WM_DWMCOLORIZATIONCOLORCHANGED) && ThemeChanged != null)
-                {
-                    if (m.Msg == WM_DWMCOLORIZATIONCOLORCHANGED)
+                    if (m.Msg == WM_DEVICECHANGE && m.WParam.ToInt64() == DBT_DEVICEARRIVAL
+                        && DeviceArrival != null && m.LParam != IntPtr.Zero)
                     {
-                        ThemeChanged();
+                        // Read only dbcc_devicetype at offset 4 of DEV_BROADCAST_HDR (avoids over-reading short headers)
+                        int devType = Marshal.ReadInt32(m.LParam, 4);
+                        if (devType == DBT_DEVTYP_DEVICEINTERFACE) DeviceArrival();
                     }
-                    else
+                    else if (m.Msg == TaskbarCreatedMessage && TaskbarCreated != null)
                     {
-                        string area = m.LParam != IntPtr.Zero ? Marshal.PtrToStringAuto(m.LParam) : null;
-                        if (string.IsNullOrEmpty(area) || string.Equals(area, "ImmersiveColorSet", StringComparison.OrdinalIgnoreCase))
+                        TaskbarCreated();
+                    }
+                    else if (m.Msg == WM_POWERBROADCAST && PowerResumed != null)
+                    {
+                        int ev = (int)(m.WParam.ToInt64() & 0xFFFF);
+                        if (ev == PBT_APMRESUMEAUTOMATIC || ev == PBT_APMRESUMESUSPEND) PowerResumed();
+                    }
+                    else if ((m.Msg == WM_SETTINGCHANGE || m.Msg == WM_DWMCOLORIZATIONCOLORCHANGED) && ThemeChanged != null)
+                    {
+                        if (m.Msg == WM_DWMCOLORIZATIONCOLORCHANGED)
+                        {
                             ThemeChanged();
+                        }
+                        else
+                        {
+                            string area = m.LParam != IntPtr.Zero ? Marshal.PtrToStringAuto(m.LParam) : null;
+                            if (string.IsNullOrEmpty(area) || string.Equals(area, "ImmersiveColorSet", StringComparison.OrdinalIgnoreCase))
+                                ThemeChanged();
+                        }
                     }
+                }
+                catch (Exception ex)
+                {
+                    ErrorLog.Write(ex, "HiddenForm.WndProc");
                 }
                 base.WndProc(ref m);
             }

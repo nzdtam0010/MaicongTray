@@ -232,103 +232,121 @@ namespace MaicongTray
             req[1] = 0x06 ^ 0xFF;
             for (int i = 2; i < len; i++) req[i] = 0xFF;
 
-            IntPtr ev = NativeHid.CreateEvent(IntPtr.Zero, true, false, null);
-            if (ev == IntPtr.Zero) return;
-
-            byte[] inBuf = new byte[entry.InputLen];
-            var ov = new NativeHid.OVERLAPPED();
-            ov.EventHandle = ev;
+            int inLen = entry.InputLen;
             bool readPosted = false;
             int readFails = 0;
             DateTime lastQuery = DateTime.MinValue;
 
-            try
+            // Unmanaged heap buffer + OVERLAPPED struct: 100% immune to GC compaction!
+            using (var uo = new NativeHid.UnmanagedOverlapped(inLen))
             {
-                while (!_stop)
+                if (uo.EventHandle == IntPtr.Zero) return;
+                try
                 {
-                    // Keep one overlapped ReadFile pending across iterations — zero CancelIoEx churn!
-                    if (!readPosted && NativeHid.ResetEvent(ev))
+                    while (!_stop)
                     {
-                        uint tmp;
-                        bool okP = NativeHid.ReadFile(h, inBuf, (uint)inBuf.Length, out tmp, ref ov);
-                        int err = NativeHid.LastError();
-                        readPosted = okP || err == NativeHid.ERROR_IO_PENDING;
-                        if (!readPosted && ++readFails >= 3)
+                        if (!readPosted)
                         {
-                            log.Add("输入读取连续失败，Win32Error=" + err + "，重新枚举设备");
-                            break;
-                        }
-                    }
-
-                    bool wantQuery = _queryNow.WaitOne(0);
-                    if (wantQuery && _dpiRefresh)
-                    {
-                        _dpiRefresh = false;
-                        int dpi = NativeHid.QueryMouseAll(h, (ushort)len, log);
-                        if (dpi > 0) _dpiValue = dpi;
-                    }
-                    if (wantQuery && !_manualQuery && (DateTime.Now - LatestAt).TotalSeconds < 25.0)
-                    {
-                        wantQuery = false;
-                    }
-                    if (wantQuery)
-                    {
-                        _manualQuery = false;
-                    }
-
-                    if (wantQuery || (DateTime.Now - lastQuery).TotalSeconds >= 15.0)
-                    {
-                        if (!NativeHid.HidD_SetFeature(h, req, req.Length))
-                        {
-                            log.Add("发送查询失败，Win32Error=" + NativeHid.LastError() + "，重新枚举设备");
-                            break;
-                        }
-                        lastQuery = DateTime.Now;
-                        if (log.Count > 200) log.RemoveRange(1, 100);
-                        log.Add("发送查询 0x11/0x06 [" + lastQuery.ToString("HH:mm:ss") + "]");
-                    }
-
-                    if (readPosted)
-                    {
-                        int waitRes = NativeHid.WaitForSingleObject(ev, 200);
-                        if (waitRes == 0)
-                        {
-                            uint got;
-                            bool okRes = NativeHid.GetOverlappedResult(h, ref ov, out got, false);
-                            readPosted = false;
-                            if (!okRes)
+                            uo.ResetForIo();
+                            uint tmp;
+                            bool okP = NativeHid.ReadFile(h, uo.Buffer, (uint)inLen, out tmp, uo.OvPtr);
+                            int err = NativeHid.LastError();
+                            if (okP)
                             {
-                                int err = NativeHid.LastError();
-                                if (++readFails >= 3)
-                                {
-                                    log.Add("读取完成异常，Win32Error=" + err + "，重新枚举设备");
-                                    break;
-                                }
-                            }
-                            else if (got >= 8)
-                            {
+                                // Completed synchronously
                                 readFails = 0;
-                                int n = (int)Math.Min(got, (uint)inBuf.Length);
-                                BatteryResult r = NativeHid.ParseE2(inBuf, n, log);
-                                if (r != null)
+                                if (tmp >= 8)
                                 {
-                                    r.Device = entry.ToString();
-                                    Publish(r, log);
-                                    lastQuery = DateTime.Now;
+                                    byte[] syncBuf = uo.ReadManaged((int)tmp);
+                                    BatteryResult sr = NativeHid.ParseE2(syncBuf, syncBuf.Length, log);
+                                    if (sr != null)
+                                    {
+                                        sr.Device = entry.ToString();
+                                        Publish(sr, log);
+                                        lastQuery = DateTime.Now;
+                                    }
+                                }
+                            }
+                            else if (err == NativeHid.ERROR_IO_PENDING)
+                            {
+                                readPosted = true;
+                            }
+                            else if (++readFails >= 3)
+                            {
+                                log.Add("输入读取连续失败，Win32Error=" + err + "，重新枚举设备");
+                                break;
+                            }
+                        }
+
+                        bool wantQuery = _queryNow.WaitOne(0);
+                        if (wantQuery && _dpiRefresh)
+                        {
+                            _dpiRefresh = false;
+                            int dpi = NativeHid.QueryMouseAll(h, (ushort)len, log);
+                            if (dpi > 0) _dpiValue = dpi;
+                        }
+                        if (wantQuery && !_manualQuery && (DateTime.Now - LatestAt).TotalSeconds < 25.0)
+                        {
+                            wantQuery = false;
+                        }
+                        if (wantQuery)
+                        {
+                            _manualQuery = false;
+                        }
+
+                        if (wantQuery || (DateTime.Now - lastQuery).TotalSeconds >= 15.0)
+                        {
+                            if (!NativeHid.HidD_SetFeature(h, req, req.Length))
+                            {
+                                log.Add("发送查询失败，Win32Error=" + NativeHid.LastError() + "，重新枚举设备");
+                                break;
+                            }
+                            lastQuery = DateTime.Now;
+                            if (log.Count > 200) log.RemoveRange(1, 100);
+                            log.Add("发送查询 0x11/0x06 [" + lastQuery.ToString("HH:mm:ss") + "]");
+                        }
+
+                        if (readPosted)
+                        {
+                            int waitRes = NativeHid.WaitForSingleObject(uo.EventHandle, 200);
+                            if (waitRes == 0)
+                            {
+                                uint got;
+                                bool okRes = NativeHid.GetOverlappedResult(h, uo.OvPtr, out got, false);
+                                readPosted = false;
+                                if (!okRes)
+                                {
+                                    int err = NativeHid.LastError();
+                                    if (++readFails >= 3)
+                                    {
+                                        log.Add("读取完成异常，Win32Error=" + err + "，重新枚举设备");
+                                        break;
+                                    }
+                                }
+                                else if (got >= 8)
+                                {
+                                    readFails = 0;
+                                    byte[] inBuf = uo.ReadManaged((int)got);
+                                    BatteryResult r = NativeHid.ParseE2(inBuf, inBuf.Length, log);
+                                    if (r != null)
+                                    {
+                                        r.Device = entry.ToString();
+                                        Publish(r, log);
+                                        lastQuery = DateTime.Now;
+                                    }
                                 }
                             }
                         }
-                    }
-                    else
-                    {
-                        Thread.Sleep(200);
+                        else
+                        {
+                            Thread.Sleep(200);
+                        }
                     }
                 }
-            }
-            finally
-            {
-                if (readPosted) NativeHid.CancelIoEx(h, IntPtr.Zero);
-                NativeHid.CloseHandle(ev);
+                finally
+                {
+                    if (readPosted) uo.CancelAndDrain(h);
+                }
             }
         }
     }

@@ -10,10 +10,9 @@ using Microsoft.Win32.SafeHandles;
 namespace MaicongTray
 {
     // Native Windows HID layer for MCHOSE mice (A7 V2 Ultra tested).
-    // Supports:
-    //  1) Classic feature-report protocol (0x11/0x06, bitwise-inverted phase alternation + E2 input push)
-    //  2) DPI/all-info query (0x12/0x67)
-    //  3) Protocol V2 fallback (0x4D/0x0900 with XOR checksum)
+    // All overlapped I/O uses pinned unmanaged heap memory (UnmanagedOverlapped)
+    // and drains cancelled IRPs before freeing buffers, completely preventing
+    // GC-compaction heap corruption (0x80131506).
     internal static class NativeHid
     {
         private const uint GENERIC_READ = 0x80000000;
@@ -76,6 +75,74 @@ namespace MaicongTray
             public IntPtr EventHandle;
         }
 
+        // Unmanaged heap holder for OVERLAPPED + I/O buffer so GC compaction can NEVER relocate
+        // memory referenced by a pending kernel IRP.
+        internal sealed class UnmanagedOverlapped : IDisposable
+        {
+            public IntPtr Buffer;
+            public int BufferLength;
+            public IntPtr OvPtr;
+            public IntPtr EventHandle;
+            private readonly int _ovSize;
+            private readonly int _evOffset;
+
+            public UnmanagedOverlapped(int bufferLength)
+            {
+                BufferLength = Math.Max(1, bufferLength);
+                Buffer = Marshal.AllocHGlobal(BufferLength);
+                Zero(Buffer, BufferLength);
+
+                _ovSize = Marshal.SizeOf(typeof(OVERLAPPED));
+                _evOffset = Marshal.OffsetOf(typeof(OVERLAPPED), "EventHandle").ToInt32();
+                OvPtr = Marshal.AllocHGlobal(_ovSize);
+                Zero(OvPtr, _ovSize);
+
+                EventHandle = CreateEvent(IntPtr.Zero, true, false, null);
+                Marshal.WriteIntPtr(OvPtr, _evOffset, EventHandle);
+            }
+
+            public void ResetForIo()
+            {
+                Zero(OvPtr, _ovSize);
+                Marshal.WriteIntPtr(OvPtr, _evOffset, EventHandle);
+                if (EventHandle != IntPtr.Zero) ResetEvent(EventHandle);
+            }
+
+            public byte[] ReadManaged(int count)
+            {
+                int n = Math.Max(0, Math.Min(count, BufferLength));
+                byte[] dst = new byte[n];
+                if (n > 0) Marshal.Copy(Buffer, dst, 0, n);
+                return dst;
+            }
+
+            public void WriteManaged(byte[] src)
+            {
+                int n = Math.Min(src.Length, BufferLength);
+                if (n > 0) Marshal.Copy(src, 0, Buffer, n);
+            }
+
+            public void CancelAndDrain(SafeFileHandle h)
+            {
+                if (h == null || h.IsInvalid || h.IsClosed || OvPtr == IntPtr.Zero) return;
+                CancelIoEx(h, OvPtr);
+                uint dummy;
+                GetOverlappedResult(h, OvPtr, out dummy, true);
+            }
+
+            private static void Zero(IntPtr ptr, int len)
+            {
+                for (int i = 0; i < len; i++) Marshal.WriteByte(ptr, i, 0);
+            }
+
+            public void Dispose()
+            {
+                if (EventHandle != IntPtr.Zero) { CloseHandle(EventHandle); EventHandle = IntPtr.Zero; }
+                if (OvPtr != IntPtr.Zero) { Marshal.FreeHGlobal(OvPtr); OvPtr = IntPtr.Zero; }
+                if (Buffer != IntPtr.Zero) { Marshal.FreeHGlobal(Buffer); Buffer = IntPtr.Zero; }
+            }
+        }
+
         internal class HidEntry
         {
             public string Path;
@@ -124,11 +191,11 @@ namespace MaicongTray
         [DllImport("hid.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern bool HidD_GetProductString(SafeFileHandle h, byte[] buffer, int length);
         [DllImport("kernel32.dll", SetLastError = true)]
-        internal static extern bool WriteFile(SafeFileHandle h, byte[] buffer, uint toWrite, out uint written, ref OVERLAPPED ov);
+        internal static extern bool WriteFile(SafeFileHandle h, IntPtr buffer, uint toWrite, out uint written, IntPtr ov);
         [DllImport("kernel32.dll", SetLastError = true)]
-        internal static extern bool ReadFile(SafeFileHandle h, byte[] buffer, uint toRead, out uint read, ref OVERLAPPED ov);
+        internal static extern bool ReadFile(SafeFileHandle h, IntPtr buffer, uint toRead, out uint read, IntPtr ov);
         [DllImport("kernel32.dll", SetLastError = true)]
-        internal static extern bool GetOverlappedResult(SafeFileHandle h, ref OVERLAPPED ov, out uint transferred, bool wait);
+        internal static extern bool GetOverlappedResult(SafeFileHandle h, IntPtr ov, out uint transferred, bool wait);
         [DllImport("kernel32.dll", SetLastError = true)]
         internal static extern bool CancelIoEx(SafeFileHandle h, IntPtr ov);
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -237,92 +304,94 @@ namespace MaicongTray
             req[1] = 0x06 ^ 0xFF;
             for (int i = 2; i < len; i++) req[i] = 0xFF;
 
-            IntPtr ev = CreateEvent(IntPtr.Zero, true, false, null);
-            if (ev == IntPtr.Zero) return null;
+            int inLen = inputLen >= 8 ? inputLen : 0;
             bool readPosted = false;
-            var ov = new OVERLAPPED();
-            ov.EventHandle = ev;
-            byte[] inBuf = new byte[inputLen >= 8 ? inputLen : 0];
-            try
+            using (var uo = new UnmanagedOverlapped(inLen > 0 ? inLen : 8))
             {
-                if (inBuf.Length > 0 && ResetEvent(ev))
+                if (uo.EventHandle == IntPtr.Zero) return null;
+                try
                 {
-                    uint tmp;
-                    bool okP = ReadFile(h, inBuf, (uint)inBuf.Length, out tmp, ref ov);
-                    readPosted = okP || LastError() == ERROR_IO_PENDING;
-                    if (!readPosted) log.Add("    挂起输入读取失败，Win32Error=" + LastError());
-                }
-
-                for (int attempt = 1; attempt <= 2; attempt++)
-                {
-                    if (!HidD_SetFeature(h, req, req.Length))
+                    if (inLen > 0)
                     {
-                        log.Add("    发送 0x11 查询失败，Win32Error=" + LastError());
-                        return null;
+                        uo.ResetForIo();
+                        uint tmp;
+                        bool okP = ReadFile(h, uo.Buffer, (uint)inLen, out tmp, uo.OvPtr);
+                        readPosted = okP || LastError() == ERROR_IO_PENDING;
+                        if (!readPosted) log.Add("    挂起输入读取失败，Win32Error=" + LastError());
                     }
 
-                    Stopwatch sw = Stopwatch.StartNew();
-                    while (sw.ElapsedMilliseconds < 7000)
+                    for (int attempt = 1; attempt <= 2; attempt++)
                     {
-                        if (readPosted)
+                        if (!HidD_SetFeature(h, req, req.Length))
                         {
-                            uint got;
-                            if (WaitForSingleObject(ev, 0) == 0 && GetOverlappedResult(h, ref ov, out got, false) && got >= 8)
+                            log.Add("    发送 0x11 查询失败，Win32Error=" + LastError());
+                            return null;
+                        }
+
+                        Stopwatch sw = Stopwatch.StartNew();
+                        while (sw.ElapsedMilliseconds < 7000)
+                        {
+                            if (readPosted)
                             {
-                                int n = (int)Math.Min(got, (uint)inBuf.Length);
-                                BatteryResult fromInput = ParseE2(inBuf, n, log);
-                                if (fromInput != null) return fromInput;
-                                if (ResetEvent(ev))
+                                uint got;
+                                if (WaitForSingleObject(uo.EventHandle, 0) == 0 && GetOverlappedResult(h, uo.OvPtr, out got, false))
                                 {
+                                    readPosted = false;
+                                    if (got >= 8)
+                                    {
+                                        byte[] inBuf = uo.ReadManaged((int)got);
+                                        BatteryResult fromInput = ParseE2(inBuf, inBuf.Length, log);
+                                        if (fromInput != null) return fromInput;
+                                    }
+                                    uo.ResetForIo();
                                     uint tmp2;
-                                    bool okP2 = ReadFile(h, inBuf, (uint)inBuf.Length, out tmp2, ref ov);
+                                    bool okP2 = ReadFile(h, uo.Buffer, (uint)inLen, out tmp2, uo.OvPtr);
                                     readPosted = okP2 || LastError() == ERROR_IO_PENDING;
                                 }
                             }
-                        }
 
-                        byte[] raw = new byte[len];
-                        raw[0] = 0x11;
-                        if (HidD_GetFeature(h, raw, raw.Length))
-                        {
-                            bool invertedPhase = raw[1] == (0x06 ^ 0xFF);
-                            bool plainPhase = raw[1] == 0x06;
-                            if (invertedPhase || plainPhase)
+                            byte[] raw = new byte[len];
+                            raw[0] = 0x11;
+                            if (HidD_GetFeature(h, raw, raw.Length))
                             {
-                                byte[] d = new byte[12];
-                                for (int i = 0; i < 12; i++) d[i] = invertedPhase ? (byte)(raw[2 + i] ^ 0xFF) : raw[2 + i];
-                                int vid = d[0] | (d[1] << 8);
-                                int flags = d[8];
-                                int battery = d[9];
-                                int charge = d[10];
-                                if (battery > 0 && battery <= 10) battery *= 10;
-                                if (vid == 0x3837 && battery >= 0 && battery <= 100)
+                                bool invertedPhase = raw[1] == (0x06 ^ 0xFF);
+                                bool plainPhase = raw[1] == 0x06;
+                                if (invertedPhase || plainPhase)
                                 {
-                                    string fw = FormatFirmware(d[4], d[5], d[6], d[7]);
-                                    log.Add("    应答(原始): " + Hex(raw.Take(Math.Min(len, 16)).ToArray()) + " FW=" + fw);
-                                    return new BatteryResult
+                                    byte[] d = new byte[12];
+                                    for (int i = 0; i < 12; i++) d[i] = invertedPhase ? (byte)(raw[2 + i] ^ 0xFF) : raw[2 + i];
+                                    int vid = d[0] | (d[1] << 8);
+                                    int flags = d[8];
+                                    int battery = d[9];
+                                    int charge = d[10];
+                                    if (battery > 0 && battery <= 10) battery *= 10;
+                                    if (vid == 0x3837 && battery >= 0 && battery <= 100)
                                     {
-                                        State = BatteryState.Battery,
-                                        Percent = battery,
-                                        Charging = (charge == 1 || charge == 3 || charge == 4),
-                                        ConnMode = flags & 0x07,
-                                        Firmware = fw,
-                                        Mode = "官方协议 0x11/0x06",
-                                        Timestamp = DateTime.Now
-                                    };
+                                        string fw = FormatFirmware(d[4], d[5], d[6], d[7]);
+                                        log.Add("    应答(原始): " + Hex(raw.Take(Math.Min(len, 16)).ToArray()) + " FW=" + fw);
+                                        return new BatteryResult
+                                        {
+                                            State = BatteryState.Battery,
+                                            Percent = battery,
+                                            Charging = (charge == 1 || charge == 3 || charge == 4),
+                                            ConnMode = flags & 0x07,
+                                            Firmware = fw,
+                                            Mode = "官方协议 0x11/0x06",
+                                            Timestamp = DateTime.Now
+                                        };
+                                    }
                                 }
                             }
+                            Thread.Sleep(100);
                         }
-                        Thread.Sleep(100);
+                        Thread.Sleep(200);
                     }
-                    Thread.Sleep(200);
+                    return null;
                 }
-                return null;
-            }
-            finally
-            {
-                if (readPosted) CancelIoEx(h, IntPtr.Zero);
-                CloseHandle(ev);
+                finally
+                {
+                    if (readPosted) uo.CancelAndDrain(h);
+                }
             }
         }
 
@@ -415,52 +484,60 @@ namespace MaicongTray
             byte[] req = new byte[outLen];
             req[0] = 0x4D; req[1] = 1; req[2] = 1; req[3] = 0; req[4] = 0; req[5] = 9; req[6] = 0; req[7] = 0; req[8] = 8;
 
-            IntPtr ev = CreateEvent(IntPtr.Zero, true, false, null);
-            if (ev == IntPtr.Zero) return null;
-            try
+            using (var uoWrite = new UnmanagedOverlapped(outLen))
+            using (var uoRead = new UnmanagedOverlapped(inLen))
             {
-                var ov = new OVERLAPPED();
-                ov.EventHandle = ev;
+                if (uoWrite.EventHandle == IntPtr.Zero || uoRead.EventHandle == IntPtr.Zero) return null;
+
+                uoWrite.WriteManaged(req);
+                uoWrite.ResetForIo();
                 uint written;
-                bool okW = WriteFile(h, req, (uint)req.Length, out written, ref ov);
+                bool okW = WriteFile(h, uoWrite.Buffer, (uint)outLen, out written, uoWrite.OvPtr);
                 if (!okW && LastError() != ERROR_IO_PENDING)
                 {
                     log.Add("    V2 写入失败，Win32Error=" + LastError());
                     return null;
                 }
-                if (WaitForSingleObject(ev, 500) != 0 || !GetOverlappedResult(h, ref ov, out written, true) || written < 9)
+                if (!okW)
                 {
-                    CancelIoEx(h, IntPtr.Zero);
-                    log.Add("    V2 写入未完成");
-                    return null;
+                    if (WaitForSingleObject(uoWrite.EventHandle, 500) != 0 || !GetOverlappedResult(h, uoWrite.OvPtr, out written, false) || written < 9)
+                    {
+                        uoWrite.CancelAndDrain(h);
+                        log.Add("    V2 写入未完成");
+                        return null;
+                    }
                 }
 
                 Stopwatch sw = Stopwatch.StartNew();
-                while (sw.ElapsedMilliseconds < 800 && ResetEvent(ev))
+                while (sw.ElapsedMilliseconds < 800)
                 {
-                    var ov2 = new OVERLAPPED();
-                    ov2.EventHandle = ev;
-                    byte[] buf = new byte[inLen];
+                    uoRead.ResetForIo();
                     uint got;
-                    bool pending = !ReadFile(h, buf, (uint)buf.Length, out got, ref ov2);
+                    bool okR = ReadFile(h, uoRead.Buffer, (uint)inLen, out got, uoRead.OvPtr);
                     int err = LastError();
-                    if (pending && err != ERROR_IO_PENDING)
+                    if (!okR && err != ERROR_IO_PENDING)
                     {
                         log.Add("    V2 读取失败，Win32Error=" + err);
                         return null;
                     }
-                    int wait = (int)Math.Max(1L, 800 - sw.ElapsedMilliseconds);
-                    if (WaitForSingleObject(ev, wait) != 0) { CancelIoEx(h, IntPtr.Zero); break; }
-                    if (!GetOverlappedResult(h, ref ov2, out got, false)) { CancelIoEx(h, IntPtr.Zero); break; }
+                    if (!okR)
+                    {
+                        int wait = (int)Math.Max(1L, 800 - sw.ElapsedMilliseconds);
+                        if (WaitForSingleObject(uoRead.EventHandle, wait) != 0 || !GetOverlappedResult(h, uoRead.OvPtr, out got, false))
+                        {
+                            uoRead.CancelAndDrain(h);
+                            break;
+                        }
+                    }
                     if (got == 0) continue;
-                    int shown = (int)Math.Min(got, 32u);
+                    byte[] buf = uoRead.ReadManaged((int)got);
+                    int shown = Math.Min(buf.Length, 32);
                     log.Add("    V2 应答: " + Hex(buf.Take(shown).ToArray()));
-                    BatteryResult r = ParseV2(buf, (int)got);
+                    BatteryResult r = ParseV2(buf, buf.Length);
                     if (r != null) return r;
                 }
                 return null;
             }
-            finally { CloseHandle(ev); }
         }
 
 #if CHECK_MODE
@@ -473,34 +550,43 @@ namespace MaicongTray
             for (int i = 2; i < len; i++) req[i] = 0xFF;
             log.Add("[diag] SetFeature(0x11, F9 FF...): " + (HidD_SetFeature(h, req, len) ? "OK" : "FAIL " + LastError()));
 
-            IntPtr ev = CreateEvent(IntPtr.Zero, true, false, null);
-            for (int round = 0; round < 10; round++)
+            using (var uo = new UnmanagedOverlapped(Math.Max(8, (int)inputLen)))
             {
-                if (ResetEvent(ev))
+                for (int round = 0; round < 10; round++)
                 {
-                    var ov = new OVERLAPPED();
-                    ov.EventHandle = ev;
-                    byte[] inBuf = new byte[inputLen];
-                    uint got;
-                    bool pending = !ReadFile(h, inBuf, (uint)inBuf.Length, out got, ref ov);
-                    int err = LastError();
-                    if (pending && err == ERROR_IO_PENDING)
+                    if (inputLen > 0)
                     {
-                        if (WaitForSingleObject(ev, 40) == 0 && GetOverlappedResult(h, ref ov, out got, false) && got > 0)
-                            log.Add("[diag] IN  r" + round + ": " + Hex(inBuf.Take((int)Math.Min(got, 24u)).ToArray()));
-                        else
-                            CancelIoEx(h, IntPtr.Zero);
+                        uo.ResetForIo();
+                        uint got;
+                        bool okR = ReadFile(h, uo.Buffer, (uint)inputLen, out got, uo.OvPtr);
+                        int err = LastError();
+                        if (!okR && err == ERROR_IO_PENDING)
+                        {
+                            if (WaitForSingleObject(uo.EventHandle, 40) == 0 && GetOverlappedResult(h, uo.OvPtr, out got, false) && got > 0)
+                            {
+                                byte[] inBuf = uo.ReadManaged((int)got);
+                                log.Add("[diag] IN  r" + round + ": " + Hex(inBuf.Take(Math.Min(inBuf.Length, 24)).ToArray()));
+                            }
+                            else
+                            {
+                                uo.CancelAndDrain(h);
+                            }
+                        }
+                        else if (okR && got > 0)
+                        {
+                            byte[] inBuf = uo.ReadManaged((int)got);
+                            log.Add("[diag] IN  r" + round + ": " + Hex(inBuf.Take(Math.Min(inBuf.Length, 24)).ToArray()));
+                        }
                     }
+                    byte[] raw = new byte[len];
+                    raw[0] = 0x11;
+                    if (HidD_GetFeature(h, raw, raw.Length))
+                        log.Add("[diag] FEAT r" + round + ": " + Hex(raw.Take(Math.Min(len, 24)).ToArray()));
+                    else
+                        log.Add("[diag] FEAT r" + round + ": FAIL " + LastError());
+                    Thread.Sleep(50);
                 }
-                byte[] raw = new byte[len];
-                raw[0] = 0x11;
-                if (HidD_GetFeature(h, raw, raw.Length))
-                    log.Add("[diag] FEAT r" + round + ": " + Hex(raw.Take(Math.Min(len, 24)).ToArray()));
-                else
-                    log.Add("[diag] FEAT r" + round + ": FAIL " + LastError());
-                Thread.Sleep(50);
             }
-            CloseHandle(ev);
         }
 #endif
 
@@ -537,7 +623,6 @@ namespace MaicongTray
             return string.Format("{0:X2}{1:X2}.{2:X2}{3:X2}", b0, b1, b2, b3);
         }
 
-        // Fast non-blocking probe of 0x11/0x06 feature buffer to read firmware version (bytes 4..7).
         internal static string TryReadFirmware(SafeFileHandle h, ushort featureLen, List<string> log)
         {
             if (featureLen < 20) return "";
